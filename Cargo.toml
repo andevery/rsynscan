@@ -1,0 +1,7 @@
+[package]
+name = "synscan"
+version = "0.1.0"
+authors = ["Alexander Veselov <github.com/andevery>"]
+
+[dependencies]
+pnet = "0.14.0"
