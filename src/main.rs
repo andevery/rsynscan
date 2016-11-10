@@ -1,4 +1,5 @@
 extern crate pnet;
+extern crate rand;
 
 // use pnet::datalink::{self, NetworkInterface};
 // use pnet::datalink::Channel::Ethernet;
@@ -72,11 +73,13 @@ fn main() {
 }
 
 fn build_syn_packet<'a>(dest: u16, buf: &'a mut [u8]) -> MutableTcpPacket<'a> {
+    let sequence = rand::thread_rng().gen::<u32>();
     let mut packet = MutableTcpPacket::new(buf).unwrap();
     packet.set_source(SOURCE_PORT);
     packet.set_destination(dest);
-    packet.set_sequence(0);
+    packet.set_sequence(sequence);
     packet.set_acknowledgement(0);
+    
 }
 
 fn handle_tcp_packet(packet: TcpPacket, addr: IpAddr) {

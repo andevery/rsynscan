@@ -5,3 +5,4 @@ authors = ["Alexander Veselov <github.com/andevery>"]
 
 [dependencies]
 pnet = "0.14.0"
+rand = "0.3.14"
