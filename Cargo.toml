@@ -1,5 +1,5 @@
 [package]
-name = "synscan"
+name = "rsynscan"
 version = "0.1.0"
 authors = ["Alexander Veselov <github.com/andevery>"]
 
