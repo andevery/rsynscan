@@ -27,7 +27,7 @@ static PORT_OPEN: u16 = TcpFlags::SYN | TcpFlags::ACK;
 static PORT_CLOSED: u16 = TcpFlags::RST;
 
 fn print_usage(program: &str) {
-    println!("Usage: {} <source.ip> <target.ip> <port>", program);
+    println!("Usage: {} <target.ip> <port>", program);
 }
 
 fn main() {
