@@ -1,23 +1,30 @@
 extern crate pnet;
 extern crate rand;
 
-// use pnet::datalink::{self, NetworkInterface};
-// use pnet::datalink::Channel::Ethernet;
-use pnet::transport;
-use pnet::transport::TransportChannelType::Layer4;
-use pnet::transport::TransportProtocol::Ipv4;
-use pnet::packet::ip::IpNextHeaderProtocols;
-use pnet::packet::ipv4::Ipv4Packet;
-use pnet::packet::tcp::{self, TcpPacket, TcpFlags, MutableTcpPacket};
-use pnet::packet::icmp::echo_request::MutableEchoRequestPacket;
-use pnet::packet::icmp::{self, IcmpPacket};
+use pnet::datalink::{self, NetworkInterface};
+use pnet::datalink::Channel::Ethernet;
 use pnet::packet::Packet;
+use pnet::packet::ethernet::EtherTypes;
+use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::ip::IpNextHeaderProtocols;
+use pnet::packet::tcp::{self, TcpPacket, TcpFlags, MutableTcpPacket};
+use pnet::packet::icmp::{self, IcmpPacket};
+use pnet::packet::icmp::echo_request::MutableEchoRequestPacket;
+use pnet::transport;
+use pnet::transport::TransportProtocol::Ipv4;
+use pnet::transport::TransportChannelType::{Layer3, Layer4};
 
-use std::env;
-use std::net::{IpAddr, Ipv4Addr};
 use rand::Rng;
 
+use std::env;
+use std::io;
+use std::time;
+use std::net::{IpAddr, Ipv4Addr};
+
 static SOURCE_PORT: u16 = 59081;
+static TIMEOUT: u64  = 1000;
+static PORT_OPEN: u16 = TcpFlags::SYN | TcpFlags::ACK;
+static PORT_CLOSED: u16 = TcpFlags::RST;
 
 fn print_usage(program: &str) {
     println!("Usage: {} <source.ip> <target.ip> <port>", program);
@@ -26,26 +33,23 @@ fn print_usage(program: &str) {
 fn main() {
     let args: Vec<String> = env::args().collect();
     let program = &args[0];
-    if args.len() != 4 {
+    if args.len() != 3 {
         print_usage(program);
         return;
     }
 
-    let source = args[1].clone();
-    let target = args[2].clone();
-    let port = args[3].clone();
-
-    let source = match source.parse::<Ipv4Addr>() {
-        Ok(ip) => ip,
-        Err(_) => panic!("{}: invalid ip address'{}'", program, source),
-    };
+    let target = args[1].clone();
+    let port = args[2].clone();
 
     let target = match target.parse::<Ipv4Addr>() {
         Ok(ip) => ip,
         Err(_) => panic!("{}: invalid ip address'{}'", program, target),
     };
 
-    route(&target);
+    let (iface, source) = match route(&target) {
+        Ok((iface, ip)) => (iface, ip),
+        Err(e) => panic!("{}: unable to lookup '{}': {}", program, target, e),
+    };
 
     let port = match port.parse::<u16>() {
         Ok(p) => p,
@@ -55,39 +59,53 @@ fn main() {
     let mut buf = [0u8; 24];
     let syn_packet = build_syn_packet(port, &source, &target, &mut buf[..]);
 
-    let (mut tx, _) = match transport::transport_channel(65536, Layer4(Ipv4(IpNextHeaderProtocols::Tcp))) {
+    let (mut tx, _) = match transport::transport_channel(4096, Layer4(Ipv4(IpNextHeaderProtocols::Tcp))) {
         Ok((tx, rx)) => (tx, rx),
         Err(e) => panic!("{}: unable to create channel: {}", program, e),
     };
 
-    tx.send_to(syn_packet, IpAddr::V4(target));
+    let (_, mut rx) = match datalink::channel(&iface, Default::default()) {
+        Ok(Ethernet(tx, rx)) => (tx, rx),
+        Ok(_) => panic!("{}: unhandled channel type.", program),
+        Err(e) => panic!("{}: unable to create channel: {}", program, e),
+    };
 
-    //
-    // let filter = |iface: &NetworkInterface| {
-    //     !iface.is_loopback() && iface.name == iface_name
-    // };
-    // let ifaces = datalink::interfaces();
-    // let iface = match ifaces.into_iter().filter(filter).next() {
-    //     Some(iface) => iface,
-    //     None => panic!("{}: unable to find interface '{}'", program, iface_name),
-    // };
+    let mut iter = rx.iter();
+    let timeout = time::Duration::from_millis(TIMEOUT);
+    let ts = time::SystemTime::now();
+    tx.send_to(syn_packet, IpAddr::V4(target)).unwrap();
+    loop {
+        match iter.next() {
+            Ok(packet) => {
+                if let Some(ipv4_packet) = match packet.get_ethertype() {
+                    EtherTypes::Ipv4 => Ipv4Packet::new(packet.payload()),
+                    _ => None,
+                } {
+                    if ipv4_packet.get_source().eq(&target)
+                        && ipv4_packet.get_next_level_protocol() == IpNextHeaderProtocols::Tcp {
 
-    // let (_, mut rx) = match transport::transport_channel(65536, Layer4(Ipv4(IpNextHeaderProtocols::Tcp))) {
-    //     Ok((tx, rx)) => (tx, rx),
-    //     Err(e) => panic!("{}: unable to create channel: {}", program, e),
-    // };
-    //
-    // let mut iter = transport::ipv4_packet_iter(&mut rx);
-    // loop {
-    //     match iter.next() {
-    //         Ok((packet, addr)) => {
-    //             if let Some(packet) = TcpPacket::new(packet.packet()) {
-    //                 handle_tcp_packet(packet, addr)
-    //             }
-    //         },
-    //         Err(e) => panic!("{}: unable to read packet: {}", program, e),
-    //     };
-    // }
+                        if let Some(tcp_packet) = TcpPacket::new(ipv4_packet.payload()) {
+                            if tcp_packet.get_source() == port {
+                                let flags = tcp_packet.get_flags();
+                                if (flags & PORT_OPEN) == PORT_OPEN {
+                                    println!("{}:{}\topen", target, port);
+                                    return
+                                } else if (flags & PORT_CLOSED) == PORT_CLOSED {
+                                    println!("{}:{}\tclosed", target, port);
+                                    return
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            Err(e) => panic!("{}: unable to read packet: {}", program, e),
+        }
+        if ts.elapsed().unwrap() > timeout {
+            println!("{}:{}\tfiltered", target, port);
+            return
+        }
+    }
 }
 
 fn build_syn_packet<'a>(dest: u16, source: &Ipv4Addr,
@@ -99,7 +117,6 @@ fn build_syn_packet<'a>(dest: u16, source: &Ipv4Addr,
     buf[23] = 0xb4; //* MSS Value: 1460
 
     let sequence = rand::thread_rng().gen::<u32>();
-    let checksum = rand::thread_rng().gen::<u16>();
     let mut packet = MutableTcpPacket::new(buf).unwrap();
     packet.set_source(SOURCE_PORT);
     packet.set_destination(dest);
@@ -118,8 +135,7 @@ fn build_syn_packet<'a>(dest: u16, source: &Ipv4Addr,
     packet
 }
 
-// fn route(target: &Ipv4Addr) -> (Ipv4Addr, Ipv4Addr) {
-fn route(target: &Ipv4Addr) {
+fn route(target: &Ipv4Addr) -> Result<(NetworkInterface, Ipv4Addr), io::Error> {
     let mut buf = [0u8; 12];
     let identifier = rand::thread_rng().gen::<u16>();
     let mut icmp_request = MutableEchoRequestPacket::new(&mut buf).unwrap();
@@ -129,39 +145,42 @@ fn route(target: &Ipv4Addr) {
     let checksum = icmp::checksum(&IcmpPacket::new(icmp_request.packet()).unwrap());
     icmp_request.set_checksum(checksum);
 
-    let (mut tx, mut rx) = match transport::transport_channel(65536, Layer4(Ipv4(IpNextHeaderProtocols::Icmp))) {
+    let protocol = Layer4(Ipv4(IpNextHeaderProtocols::Icmp));
+    let (mut tx, _) = match transport::transport_channel(4096, protocol) {
         Ok((tx, rx)) => (tx, rx),
-        Err(e) => panic!("{}: unable to create channel: {}", "ICMP", e),
+        Err(e) => return Err(e),
     };
 
-    let mut iter = transport::ipv4_packet_iter(&mut rx.clone());
-    // tx.send_to(icmp_request, IpAddr::V4(*target)).unwrap();
+    let (_, mut rx) = match transport::transport_channel(4096, Layer3(IpNextHeaderProtocols::Icmp)) {
+        Ok((tx, rx)) => (tx, rx),
+        Err(e) => return Err(e),
+    };
+
+    let mut iter = transport::ipv4_packet_iter(&mut rx);
+    tx.send_to(icmp_request, IpAddr::V4(*target)).unwrap();
+    let ts = time::SystemTime::now();
+    let timeout = time::Duration::from_millis(TIMEOUT);
     loop {
         match iter.next() {
-            Ok((packet, addr)) => {
-                if let IpAddr::V4(addr) = addr {
-                    if addr.eq(target) {
-                        let packet = IcmpPacket::new(&packet.packet()).unwrap();
-                        if packet.get_icmp_type() == icmp::IcmpType(0) {
-                            println!("{}", "received icmp");
-                            return
+            Ok((packet, _)) => {
+                if packet.get_source().eq(target) {
+                    let ip = packet.get_destination();
+                    let interfaces = datalink::interfaces();
+                    let filter = |iface: &NetworkInterface| {
+                        if let Some(ref ips) = iface.ips {
+                            ips.contains(&IpAddr::V4(ip))
+                        } else {
+                            false
                         }
-                    }
+                    };
+                    let iface = interfaces.into_iter().filter(filter).next().unwrap();
+                    return Ok((iface, ip))
                 }
-
             },
-            Err(e) => return,
+            Err(e) => return Err(e),
+        }
+        if ts.elapsed().unwrap() > timeout {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "Request timed out"));
         }
     }
-}
-
-fn handle_tcp_packet(packet: TcpPacket, addr: IpAddr) {
-    let syn_ack = TcpFlags::SYN | TcpFlags::ACK;
-    if (packet.get_flags() & syn_ack) == syn_ack {
-        println!("{:?}", packet.get_source());
-    }
-    // match packet.get_next_level_protocol() {
-    //     IpNextHeaderProtocols::Tcp => println!("{:?}", packet.payload()),
-    //     _ => println!("{:?}", packet.get_next_level_protocol()),
-    // }
 }
